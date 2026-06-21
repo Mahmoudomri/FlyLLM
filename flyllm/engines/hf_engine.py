@@ -22,9 +22,13 @@ class HFEngine(BaseEngine):
         if self.verbose:
             print(f"  Loading via HuggingFace fallback ({self.cfg.model_type})...")
 
-        # Load model architecture from HF cache
+        # IMPORTANT: self.hf_dir is the *split* directory (per-layer
+        # safetensors only) — it has no config.json/tokenizer, so HF
+        # can't build the model class from it. Load the architecture
+        # from the original model id/repo instead, then inject our
+        # dequantized layer weights on top.
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.hf_dir,
+            self.cfg.model_id,
             torch_dtype=DTYPE,
             device_map="auto" if DEVICE == "cuda" else "cpu",
             low_cpu_mem_usage=True,

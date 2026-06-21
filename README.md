@@ -2,7 +2,7 @@
 
 **Adaptive quantization for local LLMs — smarter than uniform INT4.**
 
-FlyLLM analyzes each layer using **3 mathematical metrics** and automatically assigns the optimal precision per layer. No calibration data. No manual configuration. One command.
+FlyLLM analyzes each layer using **3 metrics** and automatically picks the best precision per layer. No calibration data. No manual config. One command.
 
 ```bash
 pip install flyllm
@@ -13,37 +13,25 @@ flyllm run mistralai/Mistral-7B-v0.1 --prompt "What is AI?"
 
 ## Why FlyLLM?
 
-Every existing tool (AirLLM, GPTQ, Ollama) quantizes all layers identically:
-
-```
-Layer 0  → INT4  ❌  critical layer — outliers lost
-Layer 15 → INT4
-Layer 31 → INT4  ❌  critical layer — outliers lost
-```
+Most tools quantize every layer the same way, which can damage sensitive layers.
 
 FlyLLM analyzes first, then compresses:
 
 ```
-Layer 0  → float16  🔴  kurtosis 19.5 — outliers protected
-Layer 1  → INT8     🟡  kurtosis 7.8  — moderate sensitivity
-Layer 2  → INT4     🟢  kurtosis 4.5  — safe to compress
+score = 0.5·kurtosis + 0.3·entropy + 0.2·max_abs   (normalized per layer)
+
+Layer 0  → float16  🔴  score 0.81 — outliers protected
+Layer 1  → INT8     🟡  score 0.22 — moderate sensitivity
+Layer 2  → INT4     🟢  score 0.09 — safe to compress
 ...
-Layer 31 → float16  🔴  kurtosis 9.9  — outliers protected
+Layer 31 → float16  🔴  score 0.68 — outliers protected
 ```
 
 ---
 
-## Benchmark Results — Mistral 7B
 
-| | Float16 | FlyLLM Adaptive |
-|--|--|--|
-| Avg time/prompt | 145s | 194s |
-| vs AirLLM uniform INT4 | — | **4.33x faster** |
-| L0 cosine (critical) | 1.000 | **1.000** ✅ |
-| L31 cosine (critical) | 1.000 | **1.000** ✅ |
-| Avg cosine similarity | 1.000 | **0.9974** |
-| Accuracy (5 prompts) | 5/5 | 5/5 |
-| Calibration data | — | ❌ none needed |
+
+See [Run Benchmark](#run-benchmark) below to generate real numbers for your model.
 
 ---
 
@@ -102,32 +90,26 @@ model = FlyLLM.load("~/flyllmmodel/Mistral-7B-v0.1")
 
 ## How It Works
 
-### Step 1 — Check HF cache
-FlyLLM checks if the model is already in `~/.cache/huggingface/`. If not, downloads and splits it via AirLLM.
+**1. Check cache** — FlyLLM checks if the model is already downloaded locally. If not, it downloads it.
 
-### Step 2 — Check compressed model
-FlyLLM checks `~/flyllmmodel/ModelName/`. If not found, runs the profiler and quantizer.
+**2. Check compressed model** — FlyLLM checks `~/flyllmmodel/ModelName/`. If not found, it profiles and quantizes.
 
-### Step 3 — Profile (if needed)
+**3. Profile** — Three metrics per layer, combined into one sensitivity score:
 
-Three metrics per layer, combined into one sensitivity score:
-
-| Metric | Variation on Mistral 7B | Weight |
+| Metric | What it measures | Weight |
 |--|--|--|
-| **Kurtosis** | 3.24 ← winner | 50% |
-| Entropy | 2.30 | 30% |
-| Max Absolute Value | 1.27 | 20% |
+| **Kurtosis** | Outlier strength in weight distribution | 50% |
+| Entropy | Information density / randomness | 30% |
+| Max Absolute Value | Largest weight magnitude | 20% |
 
 Score decides precision:
 - ≥ 0.35 → **float16** (critical layers)
 - ≥ 0.15 → **INT8** (moderate)
 - < 0.15 → **INT4** (safe to compress)
 
-### Step 4 — Quantize (if needed)
-Only `model.layers.{idx}.safetensors` files are saved to `~/flyllmmodel/ModelName/`. Static weights (embed, norm, lm_head) stay in HF cache — never duplicated.
+**4. Quantize** — Only the layer files are saved to `~/flyllmmodel/ModelName/`. Static weights (embed, norm, lm_head) stay in the original cache — never duplicated.
 
-### Step 5 — Load all layers into RAM once
-All 32 compressed layers dequantized into RAM. Static weights read from HF cache. Token generation runs entirely from RAM — no SSD reads during inference.
+**5. Load into RAM once** — All 32 compressed layers are dequantized into RAM. Static weights are read from cache. Token generation runs entirely from RAM — no disk reads during inference.
 
 ---
 
@@ -144,10 +126,10 @@ All 32 compressed layers dequantized into RAM. Static weights read from HF cache
 └── flyllm_meta.json
 
 ~/.cache/huggingface/.../           ← original weights (untouched)
-├── model.embed_tokens.safetensors  ← read at inference
-├── model.norm.safetensors          ← read at inference
-├── lm_head.safetensors             ← read at inference
-└── model.layers.{0-31}.safetensors ← used for profiling only
+├── model.embed_tokens.safetensors
+├── model.norm.safetensors
+├── lm_head.safetensors
+└── model.layers.{0-31}.safetensors  ← used for profiling only
 ```
 
 ---
@@ -156,7 +138,7 @@ All 32 compressed layers dequantized into RAM. Static weights read from HF cache
 
 ```
 flyllm/
-├── config.py       Auto model detection + chat templates + cache paths
+├── config.py       Model detection + chat templates + cache paths
 ├── profiler.py     Kurtosis + Entropy + MaxAbs layer analysis
 ├── quantizer.py    Adaptive per-layer compression
 ├── loader.py       FlyLLM.from_pretrained() + FlyLLM.load()
@@ -189,8 +171,8 @@ Outputs `benchmark/results.json` and `benchmark/results.md`.
 
 | Model | Engine |
 |--|--|
-| Mistral 7B | Custom ⚡ |
-| Llama 3 8B/70B | Custom ⚡ |
+| Mistral 7B | HF fallback ⚡ |
+| Llama 3 8B/70B | HF fallback⚡ |
 | Phi-2, Phi-3 | HF fallback |
 | Qwen2 | HF fallback |
 | Any HF transformer | HF fallback |

@@ -19,6 +19,73 @@ from .quantizer import quantize_model
 from .engines import get_engine
 
 
+def _split_model_layers(snapshot_dir: str, verbose: bool = True) -> str:
+    """
+    Split a downloaded HF snapshot into per-layer safetensors files.
+    Works whether the original checkpoint was saved as a single
+    model.safetensors file or as multiple sharded files (with or
+    without model.safetensors.index.json) — unlike AirLLM's splitter,
+    which hard-requires an index.json and fails on single-file models.
+    """
+    import re
+    from collections import defaultdict
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    split_dir = os.path.join(snapshot_dir, "splitted_model")
+    os.makedirs(split_dir, exist_ok=True)
+
+    layer0_marker = os.path.join(split_dir, "model.layers.0.safetensors")
+    if os.path.exists(layer0_marker):
+        return split_dir
+
+    # Figure out which safetensors shard(s) exist for this snapshot.
+    index_path = os.path.join(snapshot_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        shard_files = sorted(set(index["weight_map"].values()))
+    else:
+        single_file = os.path.join(snapshot_dir, "model.safetensors")
+        if not os.path.exists(single_file):
+            raise RuntimeError(
+                f"No model.safetensors or model.safetensors.index.json found in "
+                f"{snapshot_dir}. This model may use a .bin checkpoint format, "
+                "which isn't supported yet."
+            )
+        shard_files = ["model.safetensors"]
+
+    if verbose:
+        print(f"  Splitting {len(shard_files)} shard(s) into per-layer files...")
+
+    layer_pat = re.compile(r"model\.layers\.(\d+)\.")
+    layer_tensors = defaultdict(dict)
+    static_tensors = {}
+
+    for shard_name in shard_files:
+        shard_path = os.path.join(snapshot_dir, shard_name)
+        with safe_open(shard_path, framework="pt") as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+                m = layer_pat.search(key)
+                if m:
+                    layer_tensors[int(m.group(1))][key] = tensor
+                else:
+                    static_tensors[key] = tensor
+
+    for idx, tensors in layer_tensors.items():
+        out_path = os.path.join(split_dir, f"model.layers.{idx}.safetensors")
+        save_file(tensors, out_path)
+
+    if static_tensors:
+        save_file(static_tensors, os.path.join(split_dir, "static.safetensors"))
+
+    if verbose:
+        print(f"  ✅ Split {len(layer_tensors)} layers → {split_dir}")
+
+    return split_dir
+
+
 def _ensure_hf_model(model_id: str, verbose: bool = True) -> str:
     """
     Make sure the model is downloaded and split in HF cache.
@@ -31,29 +98,18 @@ def _ensure_hf_model(model_id: str, verbose: bool = True) -> str:
             print(f"  ✅ Found in HF cache: {cached}")
         return cached
 
-    # Download + split via AirLLM
     if verbose:
-        print(f"  Downloading {model_id} from HuggingFace...")
-        print(f"  (using AirLLM to split layers...)\n")
+        print(f"  Downloading {model_id} from HuggingFace...\n")
 
-    try:
-        from airllm import AutoModel
-        model = AutoModel.from_pretrained(model_id)
-        del model
+    from huggingface_hub import snapshot_download
+    snapshot_dir = snapshot_download(model_id)
 
-        # Check again after download
-        cached = get_hf_cache_dir(model_id)
-        if cached:
-            if verbose:
-                print(f"  ✅ Downloaded and split: {cached}")
-            return cached
-    except ImportError:
-        raise ImportError(
-            "AirLLM is required to download and split models. "
-            "Install it with: pip install airllm"
-        )
+    split_dir = _split_model_layers(snapshot_dir, verbose=verbose)
 
-    raise RuntimeError(f"Could not download or find model: {model_id}")
+    cached = get_hf_cache_dir(model_id)
+    if cached:
+        return cached
+    return split_dir
 
 
 def _ensure_flyllm_model(model_id: str, hf_dir: str,
@@ -205,10 +261,13 @@ class FlyLLM:
         messages  = [{"role": "user", "content": prompt}]
         formatted = format_prompt(messages, self.cfg, system or self._system)
         input_ids = self.tokenizer(formatted, return_tensors="pt")["input_ids"]
+        stop_ids = self.tokenizer("[INST]", add_special_tokens=False)["input_ids"]
+
         tokens    = list(self.engine.generate_tokens(
             input_ids, max_new_tokens=max_new_tokens,
             temperature=temperature, top_p=top_p,
             tokenizer=self.tokenizer,
+            stop_ids=stop_ids,
         ))
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
 

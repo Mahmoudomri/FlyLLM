@@ -32,10 +32,116 @@ PROMPTS = [
     "A train travels at 60km/h for 2 hours. How far? Number and unit only.",
     "All birds have wings. Penguins are birds. Do penguins have wings? Yes or no and why.",
     "What is the capital of Germany? One word.",
+    "What is 9 + 6 × 2? Follow order of operations and give only the number.",
+    "If a pizza is cut into 8 equal slices and you eat 3, how many are left? Number only.",
+    "Which is larger: 0.7 or 0.65? Answer with the number only.",
+    "Spell the word 'environment' backwards.",
+    "If today is Monday, what day will it be after 3 days? One word.",
+
+    # Arithmetic
+    "What is 144 divided by 12? Number only.",
+    "What is 17 × 8? Number only.",
+    "What is the square root of 81? Number only.",
+    "What is 25% of 80? Number only.",
+    "What is 7 squared? Number only.",
+
+    # Logic
+    "All roses are flowers. Some flowers fade quickly. Are all roses flowers? Yes or no.",
+    "Tom is older than Sarah. Sarah is older than Mike. Who is the youngest? One word.",
+    "If every cat is an animal and Felix is a cat, is Felix an animal? Yes or no.",
+    "A is greater than B. B is greater than C. Which is largest? One letter.",
+    "If five people each have two apples, how many apples are there? Number only.",
+
+    # Counting
+    "How many months are there in a year? Number only.",
+    "How many sides does a hexagon have? Number only.",
+    "How many days are in two weeks? Number only.",
+    "How many letters are in the word 'quantization'? Number only.",
+    "How many vowels are in the word 'artificial'? Number only.",
+
+    # Commonsense
+    "Which is heavier: 1 kilogram of steel or 1 kilogram of feathers? One sentence.",
+    "Can a fish breathe underwater? Yes or no.",
+    "Is ice usually hotter than fire? Yes or no.",
+    "Which animal typically barks: cat or dog? One word.",
+    "Can humans normally fly without machines? Yes or no.",
+
+    # Temporal reasoning
+    "If today is Friday, what day is 5 days later? One word.",
+    "If yesterday was Tuesday, what day is today? One word.",
+    "How many hours are in 2 days? Number only.",
+    "What month comes after April? One word.",
+    "What season comes after spring? One word.",
+
+    # Language
+    "Spell the word 'algorithm' backwards.",
+    "What is the opposite of 'cold'? One word.",
+    "Complete the sequence: A, C, E, G, ? One letter.",
+    "What is the plural of 'child'? One word.",
+    "Which word is misspelled: cat, house, applle, tree? One word.",
+
+    # Multi-step reasoning
+    "A box contains 10 balls. 3 are removed and 2 are added. How many remain? Number only.",
+    "If a car travels 50 km in 1 hour, how far will it travel in 3 hours? Number and unit only.",
+    "Sarah has 12 candies. She gives away 5 and buys 4 more. How many does she have now? Number only.",
+    "A rectangle has length 5 and width 4. What is its area? Number only.",
+    "If 3 notebooks cost $12, how much does one notebook cost? Number only."
 ]
 
-EXPECTED = ["36", "Sue", "120 km", "yes", "Berlin"]
+EXPECTED = [
+    "36",
+    "Sue",
+    "120 km",
+    "yes",
+    "Berlin",
+    "21",
+    "5",
+    "0.7",
+    "tnemnorivne",
+    "Thursday",
 
+    "12",
+    "136",
+    "9",
+    "20",
+    "49",
+
+    "yes",
+    "Mike",
+    "yes",
+    "A",
+    "10",
+
+    "12",
+    "6",
+    "14",
+    "12",
+    "5",
+
+    "They weigh the same.",
+    "yes",
+    "no",
+    "dog",
+    "no",
+
+    "Wednesday",
+    "Wednesday",
+    "48",
+    "May",
+    "Summer",
+
+    "mhtirogla",
+    "hot",
+    "I",
+    "children",
+    "applle",
+
+    "9",
+    "150 km",
+    "11",
+    "20",
+    "4"
+]
 
 def cosine_sim(a, b):
     a = a.float().flatten()
@@ -85,20 +191,24 @@ def measure_cosine(hf_dir, flyllm_dir, num_layers):
 
 
 def run_pass(label, engine, tokenizer, cfg):
-    """Run all prompts through engine, return results."""
     results = []
     for prompt, expected in zip(PROMPTS, EXPECTED):
         messages  = [{"role": "user", "content": prompt}]
         formatted = format_prompt(messages, cfg)
         input_ids = tokenizer(formatted, return_tensors="pt")["input_ids"]
+        input_len = input_ids.shape[1]  # ← remember input length
 
         t0     = time.time()
         tokens = list(engine.generate_tokens(
             input_ids, max_new_tokens=60, temperature=0.0
         ))
         elapsed = time.time() - t0
+
+        # Decode ONLY new tokens — not the prompt
         answer  = tokenizer.decode(tokens, skip_special_tokens=True)
-        correct = expected.lower() in answer.lower()
+        
+        # Flexible correct check — strip spaces and punctuation
+        correct = expected.lower().replace(" ", "") in answer.lower().replace(" ", "")
 
         results.append({
             "prompt":  prompt,
@@ -137,7 +247,7 @@ def run_benchmark(model_id: str) -> dict:
         )
 
     cfg       = load_config(model_id)
-    tokenizer = AutoTokenizer.from_pretrained(hf_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     print(f"\n{'='*65}")
     print(f"  FlyLLM Benchmark")

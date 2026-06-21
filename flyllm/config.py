@@ -65,6 +65,7 @@ class ModelConfig:
     rope_theta:              float
     vocab_size:              int
     chat_template:           str
+    model_id:                str = ""
     bos_token_id:            int = 1
     eos_token_id:            Union[int, List[int]] = 2
 
@@ -101,6 +102,7 @@ def load_config(model_id_or_path: str) -> ModelConfig:
         rope_theta              = hf_cfg.get("rope_theta", 10000.0),
         vocab_size              = hf_cfg.get("vocab_size", 32000),
         chat_template           = template,
+        model_id                = model_id_or_path,
         bos_token_id            = hf_cfg.get("bos_token_id", 1),
         eos_token_id            = hf_cfg.get("eos_token_id", 2),
     )
