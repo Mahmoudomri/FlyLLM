@@ -7,6 +7,7 @@ import os
 import math
 import torch
 import torch.nn.functional as F
+from collections import OrderedDict
 from safetensors.torch import load_file
 
 from .base import BaseEngine
@@ -16,6 +17,9 @@ from ..quantizer import dequantize_tensor
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE  = torch.float16
 
+# Same speed/RAM knob as mistral.py -- see comments there.
+HOT_CACHE_SIZE = 0
+
 
 def _load_raw_layer(path):
     """Load one layer's tensors WITHOUT dequantizing — stays compressed in RAM."""
@@ -23,21 +27,57 @@ def _load_raw_layer(path):
 
 
 def _dequantize_layer_to_device(raw, device):
-    """Move ONE layer's compressed tensors to `device` and dequantize there."""
+    """Move ONE layer's compressed tensors to `device` and dequantize there.
+    Batches the H2D transfer instead of doing one .to() call per tensor."""
     main = [k for k in raw if not any(
         k.endswith(s) for s in [".__scales", ".__shape", ".__prec"]
     )]
+
+    keys_in_order = []
+    cpu_tensors   = []
+    for key in main:
+        keys_in_order.append(("q", key))
+        cpu_tensors.append(raw[key])
+        sk = f"{key}.__scales"
+        if sk in raw:
+            keys_in_order.append(("scales", key))
+            cpu_tensors.append(raw[sk])
+
+    device_tensors = [t.to(device, non_blocking=True) for t in cpu_tensors]
+
+    moved = {}
+    for (kind, key), dt in zip(keys_in_order, device_tensors):
+        moved.setdefault(key, {})[kind] = dt
+
     out = {}
     for key in main:
-        q  = raw[key].to(device, non_blocking=True)
-        sk = f"{key}.__scales"
-        if sk not in raw:
+        q = moved[key]["q"]
+        if "scales" not in moved[key]:
             out[key] = q.to(DTYPE)
             continue
-        meta = {"scales": raw[sk].to(device, non_blocking=True),
-                 "shape": raw[f"{key}.__shape"], "prec": raw[f"{key}.__prec"]}
+        meta = {"scales": moved[key]["scales"],
+                "shape": raw[f"{key}.__shape"], "prec": raw[f"{key}.__prec"]}
         out[key] = dequantize_tensor(q, meta, DTYPE)
     return out
+
+
+class _HotCache:
+    """Tiny LRU of decompressed layers -- see mistral.py for details."""
+    def __init__(self, size):
+        self.size = size
+        self._od  = OrderedDict()
+
+    def get_or_build(self, idx, raw, device):
+        if self.size <= 0:
+            return _dequantize_layer_to_device(raw, device)
+        if idx in self._od:
+            self._od.move_to_end(idx)
+            return self._od[idx]
+        W = _dequantize_layer_to_device(raw, device)
+        self._od[idx] = W
+        if len(self._od) > self.size:
+            self._od.popitem(last=False)
+        return W
 
 
 def _build_rope(seq_len, head_dim, theta):
@@ -141,6 +181,8 @@ class LlamaEngine(BaseEngine):
             cfg.max_position_embeddings, HD, cfg.rope_theta
         )
 
+        self._hot_cache = _HotCache(HOT_CACHE_SIZE)
+
     def reset_cache(self):
         self.kv_cache = [
             {"k": None, "v": None} for _ in range(self.cfg.num_hidden_layers)
@@ -150,15 +192,19 @@ class LlamaEngine(BaseEngine):
         cfg = self.cfg
         if not hasattr(self, "kv_cache"):
             self.reset_cache()
+        if not hasattr(self, "_hot_cache"):
+            self._hot_cache = _HotCache(HOT_CACHE_SIZE)
 
         h   = F.embedding(input_ids.to(DEVICE), self.cache["embed"].to(DEVICE))
         cos, sin = self.cache["cos"], self.cache["sin"]
 
+        # empty_cache() restored: needed for stability on small GPUs.
         for i in range(cfg.num_hidden_layers):
-            W = _dequantize_layer_to_device(self.cache["layers"][i], DEVICE)
+            W = self._hot_cache.get_or_build(i, self.cache["layers"][i], DEVICE)
             h = _layer_fwd(h, W, cos, sin, cfg, f"model.layers.{i}", self.kv_cache[i])
             del W
-            if DEVICE == "cuda": torch.cuda.empty_cache()
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
 
         v = h.float().pow(2).mean(-1, keepdim=True)
         h = (self.cache["norm"].to(DEVICE) * h * torch.rsqrt(v + cfg.rms_norm_eps)).to(DTYPE)

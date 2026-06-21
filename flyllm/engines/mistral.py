@@ -9,6 +9,7 @@ import os
 import math
 import torch
 import torch.nn.functional as F
+from collections import OrderedDict
 from safetensors.torch import load_file
 
 from .base import BaseEngine
@@ -17,6 +18,11 @@ from ..quantizer import dequantize_tensor
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE  = torch.float16
+
+# How many layers to keep decompressed in a small LRU cache. 0 = decompress
+# fresh every call, never keep any (lowest RAM/VRAM use). Set higher only
+# if you have GPU headroom to spare -- on small GPUs this can cause OOM.
+HOT_CACHE_SIZE = 0
 
 
 # ── Layer loading — stays compressed in RAM ───────────────────
@@ -29,26 +35,75 @@ def _load_raw_layer(path: str) -> dict:
 def _dequantize_layer_to_device(raw: dict, device) -> dict:
     """
     Move ONE layer's still-compressed tensors to `device` and dequantize
-    them there. Called fresh every forward pass — RAM only ever holds the
-    compressed (~5GB) version, never the full fp16 (~14GB) version.
+    them there. RAM only ever holds the compressed version; this fp16
+    result is meant to be used and discarded (or kept briefly in the
+    hot cache below).
+
+    Transfers are batched: all tensors for this layer are concatenated
+    into a single buffer and moved to device in one .to() call instead
+    of one call per tensor, to cut per-call CUDA launch overhead.
     """
     main = [k for k in raw if not any(
         k.endswith(s) for s in [".__scales", ".__shape", ".__prec"]
     )]
+
+    # Batch the actual GPU transfer: gather every CPU tensor we need
+    # (main weights + scales) into one list, move it in a single call,
+    # then unpack. Shapes/precs are tiny int32 metadata -- left on CPU.
+    keys_in_order = []
+    cpu_tensors   = []
+    for key in main:
+        keys_in_order.append(("q", key))
+        cpu_tensors.append(raw[key])
+        sk = f"{key}.__scales"
+        if sk in raw:
+            keys_in_order.append(("scales", key))
+            cpu_tensors.append(raw[sk])
+
+    # torch._foreach_copy-style batched transfer: one stream of H2D copies
+    # issued back-to-back (non_blocking) rather than awaited individually.
+    device_tensors = [t.to(device, non_blocking=True) for t in cpu_tensors]
+
+    moved = {}
+    for (kind, key), dt in zip(keys_in_order, device_tensors):
+        moved.setdefault(key, {})[kind] = dt
+
     out = {}
     for key in main:
-        q  = raw[key].to(device, non_blocking=True)
-        sk = f"{key}.__scales"
-        if sk not in raw:
+        q = moved[key]["q"]
+        if "scales" not in moved[key]:
             out[key] = q.to(DTYPE)
             continue
         meta = {
-            "scales": raw[sk].to(device, non_blocking=True),
+            "scales": moved[key]["scales"],
             "shape":  raw[f"{key}.__shape"],   # tiny int32 list, fine on CPU
             "prec":   raw[f"{key}.__prec"],
         }
         out[key] = dequantize_tensor(q, meta, DTYPE)
     return out
+
+
+class _HotCache:
+    """Tiny LRU cache of decompressed layers, keyed by layer index.
+    Keeps the most recently used HOT_CACHE_SIZE layers in fp16 so
+    back-to-back tokens don't all pay full dequant cost every time.
+    Set HOT_CACHE_SIZE = 0 to disable (pure V2 behavior).
+    """
+    def __init__(self, size):
+        self.size = size
+        self._od  = OrderedDict()
+
+    def get_or_build(self, idx, raw, device):
+        if self.size <= 0:
+            return _dequantize_layer_to_device(raw, device)
+        if idx in self._od:
+            self._od.move_to_end(idx)
+            return self._od[idx]
+        W = _dequantize_layer_to_device(raw, device)
+        self._od[idx] = W
+        if len(self._od) > self.size:
+            self._od.popitem(last=False)
+        return W
 
 
 # ── RoPE ─────────────────────────────────────────────────────
@@ -190,6 +245,9 @@ class MistralEngine(BaseEngine):
         if self.verbose:
             print(f"  RoPE cache ready.")
 
+        # ── Small LRU of decompressed layers (speed/RAM middle ground) ──
+        self._hot_cache = _HotCache(HOT_CACHE_SIZE)
+
     def reset_cache(self):
         """Call at the start of each generation — wipes the per-layer K/V cache."""
         self.kv_cache = [
@@ -209,6 +267,8 @@ class MistralEngine(BaseEngine):
 
         if not hasattr(self, "kv_cache"):
             self.reset_cache()
+        if not hasattr(self, "_hot_cache"):
+            self._hot_cache = _HotCache(HOT_CACHE_SIZE)
 
         # Embedding (only for the new tokens passed in)
         h = F.embedding(
@@ -216,9 +276,12 @@ class MistralEngine(BaseEngine):
             self.cache["embed"].to(DEVICE)
         )
 
-        # 32 layers — each one decompressed fresh, right as it hits the GPU
+        # 32 layers — decompressed via the small hot cache (or fresh,
+        # if HOT_CACHE_SIZE == 0). empty_cache() restored here: on small
+        # GPUs, skipping it causes fragmentation/OOM; the CUDA sync cost
+        # is worth it for stability on limited VRAM.
         for i in range(cfg.num_hidden_layers):
-            W = _dequantize_layer_to_device(self.cache["layers"][i], DEVICE)
+            W = self._hot_cache.get_or_build(i, self.cache["layers"][i], DEVICE)
             h = _layer_fwd(h, W, cos, sin, cfg, f"model.layers.{i}", self.kv_cache[i])
             del W
             if DEVICE == "cuda":

@@ -208,6 +208,7 @@ class FlyLLM:
         tokens    = list(self.engine.generate_tokens(
             input_ids, max_new_tokens=max_new_tokens,
             temperature=temperature, top_p=top_p,
+            tokenizer=self.tokenizer,
         ))
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
@@ -225,6 +226,7 @@ class FlyLLM:
         for token_id in self.engine.generate_tokens(
             input_ids, max_new_tokens=max_new_tokens,
             temperature=temperature, top_p=top_p, stream=True,
+            tokenizer=self.tokenizer,
         ):
             yield self.tokenizer.decode([token_id], skip_special_tokens=True)
 
@@ -234,7 +236,8 @@ class FlyLLM:
         formatted = format_prompt(self._history, self.cfg, self._system)
         input_ids = self.tokenizer(formatted, return_tensors="pt")["input_ids"]
         tokens    = list(self.engine.generate_tokens(
-            input_ids, max_new_tokens=max_new_tokens, temperature=temperature
+            input_ids, max_new_tokens=max_new_tokens, temperature=temperature,
+            tokenizer=self.tokenizer,
         ))
         response  = self.tokenizer.decode(tokens, skip_special_tokens=True)
         self._history.append({"role": "assistant", "content": response})

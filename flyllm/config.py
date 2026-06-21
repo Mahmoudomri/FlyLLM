@@ -7,6 +7,7 @@ import os
 import json
 from dataclasses import dataclass
 from typing import Optional
+from typing import Union, List
 
 
 FLYLLM_HOME = os.path.expanduser("~/flyllmmodel")
@@ -65,7 +66,7 @@ class ModelConfig:
     vocab_size:              int
     chat_template:           str
     bos_token_id:            int = 1
-    eos_token_id:            int = 2
+    eos_token_id:            Union[int, List[int]] = 2
 
 
 def load_config(model_id_or_path: str) -> ModelConfig:
