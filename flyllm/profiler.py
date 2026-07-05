@@ -39,12 +39,8 @@ def _max_abs(flat: torch.Tensor) -> float:
     return float(flat.abs().max())
 
 
-def _score_layer(tensors: dict, kurt_ceil: float, mabs_ceil: float) -> dict:
-    """
-    Compute combined score for one layer.
-    Ceilings are computed per-model from observed data (99th percentile)
-    so normalization adapts to any architecture — not just Mistral 7B.
-    """
+def _score_layer(tensors: dict) -> dict:
+    """Compute combined score for one layer — exact same logic as combined_profiler.py"""
     all_vals = []
     for tensor in tensors.values():
         if tensor.dim() >= 2:
@@ -61,10 +57,10 @@ def _score_layer(tensors: dict, kurt_ceil: float, mabs_ceil: float) -> dict:
     entr = _entropy(flat)
     mabs = _max_abs(flat)
 
-    # Data-driven normalization — ceilings from model's own 99th percentile
-    kurt_norm = float(np.clip((kurt - 3.0) / max(kurt_ceil - 3.0, 1.0), 0, 1))
-    mabs_norm = float(np.clip(mabs / max(mabs_ceil, 0.01), 0, 1))
-    entr_norm = entr  # already normalized to [0,1] via log(32)
+    # Normalize — same ranges as combined_profiler.py
+    kurt_norm = float(np.clip((kurt - 3.0) / 17.0, 0, 1))
+    mabs_norm = float(np.clip((mabs - 0.05) / 0.45, 0, 1))
+    entr_norm = entr  # already normalized to [0,1]
 
     # Weighted score — 0.5 / 0.3 / 0.2
     score = (kurt_norm * 0.5) + (entr_norm * 0.3) + (mabs_norm * 0.2)
@@ -114,41 +110,11 @@ def profile_model(
 
     if verbose:
         print(f"  Architecture : {cfg.model_type}")
-        print(f"  Layers       : {cfg.num_hidden_layers}")
-        print(f"  Pass 1/2     : computing normalization ceilings...\n")
-
-    # ── Pass 1: collect raw kurtosis and max_abs from every layer ─────────
-    # We need to see the full distribution before normalizing so that
-    # outlier layers don't dominate — works correctly on any architecture.
-    raw = {}
-    for idx in range(cfg.num_hidden_layers):
-        path = os.path.join(hf_dir, f"model.layers.{idx}.safetensors")
-        if not os.path.exists(path):
-            continue
-        t = load_file(path, device="cpu")
-        vals = torch.cat([v.float().flatten() for v in t.values() if v.dim() >= 2])
-        std = vals.std()
-        kurt = float((((vals - vals.mean()) / (std + 1e-8)) ** 4).mean()) if std > 1e-8 else 3.0
-        raw[idx] = (kurt, float(vals.abs().max()))
-        del t, vals
-
-    if not raw:
-        raise RuntimeError(f"No layer files found in {hf_dir}")
-
-    # 99th percentile — robust to single extreme outlier layers
-    kurt_ceil = float(np.percentile([v[0] for v in raw.values()], 99))
-    mabs_ceil = float(np.percentile([v[1] for v in raw.values()], 99))
-
-    if verbose:
-        print(f"  Normalization ceilings (99th percentile):")
-        print(f"    Kurtosis ceiling : {kurt_ceil:.2f}")
-        print(f"    MaxAbs ceiling   : {mabs_ceil:.4f}")
-        print(f"\n  Pass 2/2     : scoring and assigning precision...\n")
+        print(f"  Layers       : {cfg.num_hidden_layers}\n")
         print(f"  {'L':<5} {'Kurt':>8} {'Entrop':>8} {'MaxAbs':>8} "
               f"{'SCORE':>8}  {'Bar':<22} Precision")
         print(f"  {'-'*75}")
 
-    # ── Pass 2: score every layer using model-specific ceilings ───────────
     profile = {
         "model_id":   model_id,
         "model_type": cfg.model_type,
@@ -166,7 +132,7 @@ def profile_model(
             continue
 
         tensors = load_file(path, device="cpu")
-        result  = _score_layer(tensors, kurt_ceil=kurt_ceil, mabs_ceil=mabs_ceil)
+        result  = _score_layer(tensors)
         del tensors
 
         profile["layers"][str(idx)] = result
@@ -186,15 +152,13 @@ def profile_model(
     reduction = round((1 - avg_bits / 16) * 100, 1)
 
     profile["summary"] = {
-        "avg_bits":         round(avg_bits, 2),
-        "size_reduction":   reduction,
-        "float16_layers":   counts["float16"],
-        "int8_layers":      counts["int8"],
-        "int4_layers":      counts["int4"],
-        "score_min":        round(min(all_scores), 4),
-        "score_max":        round(max(all_scores), 4),
-        "norm_kurt_ceil":   round(kurt_ceil, 4),
-        "norm_mabs_ceil":   round(mabs_ceil, 4),
+        "avg_bits":       round(avg_bits, 2),
+        "size_reduction": reduction,
+        "float16_layers": counts["float16"],
+        "int8_layers":    counts["int8"],
+        "int4_layers":    counts["int4"],
+        "score_min":      round(min(all_scores), 4),
+        "score_max":      round(max(all_scores), 4),
     }
 
     if verbose:
