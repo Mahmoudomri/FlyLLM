@@ -16,7 +16,7 @@ from .config import ModelConfig, load_config, get_hf_cache_dir, get_flyllm_dir
 
 # Thresholds — proven on Mistral 7B
 THRESHOLD_FLOAT16 = 0.35
-THRESHOLD_INT8    = 0.15
+THRESHOLD_INT8    = 0.18
 
 
 def _kurtosis(flat: torch.Tensor) -> float:
