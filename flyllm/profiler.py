@@ -59,7 +59,7 @@ def _score_layer(tensors: dict) -> dict:
 
     # Normalize — same ranges as combined_profiler.py
     kurt_norm = float(np.clip((kurt - 3.0) / 17.0, 0, 1))
-    mabs_norm = float(np.clip((mabs - 0.05) / 0.45, 0, 1))
+    mabs_norm = float(np.clip((mabs - 0.05) / 1.95, 0, 1))
     entr_norm = entr  # already normalized to [0,1]
 
     # Weighted score — 0.5 / 0.3 / 0.2
