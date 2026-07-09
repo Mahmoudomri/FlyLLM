@@ -1,312 +1,194 @@
 """
-FlyLLM - Public API
-Handles the full flow:
-1. Check HF cache — download if needed (via AirLLM split)
-2. Check ~/flyllmmodel/ModelName — quantize if needed
-3. Load compressed layers into RAM
-4. Inference
+FlyLLM - HuggingFace Fallback Engine
+For any model not covered by custom engines (Phi, Qwen2, Falcon, etc.)
+
+Lazy per-layer dequantization: the model stays compressed (int4/int8)
+in RAM at all times. Each decoder layer is dequantized to fp16 only
+during its own forward pass (via a pre-hook), and freed immediately
+after (via a post-hook). At any given moment only ONE layer's worth
+of fp16 weights exists on the GPU/CPU, instead of the whole model.
+
+NOTE: the model is built with device_map="meta", so its parameters
+start as meta tensors (no real storage). Meta tensors are a distinct
+type from real tensors, so PyTorch refuses `param.data = real_tensor`
+(RuntimeError: incompatible tensor type). The fix is to replace the
+Parameter object itself in the module's `_parameters` dict instead of
+mutating `.data` on the existing (meta) Parameter.
+
+Trade-off: every layer is re-dequantized on every single forward call
+(every token), which costs CPU/transfer time each step. This trades
+speed for RAM/VRAM footprint — it does not make generation faster,
+it makes it fit in less memory.
 """
-
 import os
-import json
-from typing import Optional, Iterator
-from transformers import AutoTokenizer
+import torch
+from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM
+from .base import BaseEngine
+from ..quantizer import dequantize_tensor
 
-from .config import (load_config, format_prompt, ModelConfig,
-                     get_hf_cache_dir, get_flyllm_dir, get_model_name)
-from .profiler import profile_model
-from .quantizer import quantize_model
-from .engines import get_engine
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE  = torch.float16
 
 
-def _split_model_layers(snapshot_dir: str, verbose: bool = True) -> str:
-    """
-    Split a downloaded HF snapshot into per-layer safetensors files.
-    Works whether the original checkpoint was saved as a single
-    model.safetensors file or as multiple sharded files (with or
-    without model.safetensors.index.json) — unlike AirLLM's splitter,
-    which hard-requires an index.json and fails on single-file models.
-    """
-    import re
-    from collections import defaultdict
-    from safetensors import safe_open
-    from safetensors.torch import save_file
+class HFEngine(BaseEngine):
 
-    split_dir = os.path.join(snapshot_dir, "splitted_model")
-    os.makedirs(split_dir, exist_ok=True)
+    def load(self):
+        if self.verbose:
+            print(f"  Loading via HuggingFace fallback ({self.cfg.model_type})...")
 
-    layer0_marker = os.path.join(split_dir, "model.layers.0.safetensors")
-    if os.path.exists(layer0_marker):
-        return split_dir
+        # Build the model with EMPTY/meta weights only — no real fp16
+        # storage is allocated for the decoder layers at this point.
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.cfg.model_id,
+            torch_dtype=DTYPE,
+            device_map="meta",
+            low_cpu_mem_usage=True,
+        )
+        self.model.eval()
 
-    # Figure out which safetensors shard(s) exist for this snapshot.
-    index_path = os.path.join(snapshot_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            index = json.load(f)
-        shard_files = sorted(set(index["weight_map"].values()))
-    else:
-        single_file = os.path.join(snapshot_dir, "model.safetensors")
-        if not os.path.exists(single_file):
-            raise RuntimeError(
-                f"No model.safetensors or model.safetensors.index.json found in "
-                f"{snapshot_dir}. This model may use a .bin checkpoint format, "
-                "which isn't supported yet."
+        # Keep compressed layers RAW in RAM — never dequantized here.
+        # This dict is the only place the model's decoder weights live
+        # persistently; it stays populated for the whole session.
+        self.cache_layers = {}
+        cfg = self.cfg
+        for idx in range(cfg.num_hidden_layers):
+            path = os.path.join(self.flyllm_dir, f"model.layers.{idx}.safetensors")
+            if os.path.exists(path):
+                self.cache_layers[idx] = load_file(path, device="cpu")
+            if self.verbose:
+                print(f"  Layer {idx:2d}/{cfg.num_hidden_layers-1} ✓ (compressed)",
+                      end="\r", flush=True)
+
+        if self.verbose:
+            print(f"\n  All {cfg.num_hidden_layers} layers in RAM (compressed).")
+
+        # Static weights (embed/norm/lm_head) need real values loaded
+        # once — they're small relative to the decoder stack. These
+        # also start as meta tensors and need the same _parameters
+        # replacement trick, not a .data assignment.
+        self._load_static_weights()
+
+        # Attach hooks: dequant-inject before each layer runs,
+        # free right after it's done.
+        self._attach_lazy_hooks()
+
+        if self.verbose:
+            print(f"  Model ready — layers stay compressed, "
+                  f"decompressed on demand per forward call.")
+
+    def _set_param(self, module, name, tensor):
+        """Replace a (possibly meta) Parameter with a real one, or set
+        a plain buffer/attribute. Works regardless of whether the
+        current value is a meta tensor or a real one."""
+        if name in module._parameters:
+            module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=False)
+        elif name in module._buffers:
+            module._buffers[name] = tensor
+        else:
+            setattr(module, name, tensor)
+
+    def _load_static_weights(self):
+        # embed_tokens, norm, and lm_head are all saved together in a
+        # single static.safetensors file by the splitter (loader.py),
+        # not as three separate files — this must match that layout.
+        path = os.path.join(self.hf_dir, "static.safetensors")
+        if not os.path.exists(path):
+            if self.verbose:
+                print(f"  WARNING: static.safetensors not found at {path} — "
+                      f"embed/norm/lm_head will stay uninitialized (meta)!")
+            return
+        d = load_file(path, device="cpu")
+        for key, tensor in d.items():
+            parts  = key.split(".")
+            module = self.model
+            try:
+                for p in parts[:-1]:
+                    module = getattr(module, p)
+                self._set_param(module, parts[-1], tensor.to(DTYPE).to(DEVICE))
+            except AttributeError:
+                if self.verbose:
+                    print(f"  WARNING: could not set static param {key}")
+
+    def _dequant_layer(self, idx):
+        """Dequantize one layer's compressed tensors to fp16 on DEVICE.
+        Reads only from self.cache_layers[idx] (RAM, compressed) —
+        never mutates it, so the same compressed copy is reused
+        every single token."""
+        raw = self.cache_layers.get(idx)
+        if raw is None:
+            return {}
+        main = [k for k in raw if not any(
+            k.endswith(s) for s in [".__scales", ".__shape", ".__prec"]
+        )]
+        out = {}
+        for key in main:
+            q  = raw[key]
+            sk = f"{key}.__scales"
+            if sk in raw:
+                meta = {
+                    "scales": raw[sk],
+                    "shape":  raw[f"{key}.__shape"],
+                    "prec":   raw[f"{key}.__prec"],
+                }
+                out[key] = dequantize_tensor(q, meta, DTYPE).to(DEVICE)
+            else:
+                # float16 layers (e.g. L0, last layer) have no meta —
+                # already stored at full precision, just move+cast.
+                out[key] = q.to(DTYPE).to(DEVICE)
+        return out
+
+    def _attach_lazy_hooks(self):
+        cfg = self.cfg
+        for idx in range(cfg.num_hidden_layers):
+            layer = self.model.model.layers[idx]
+
+            def pre_hook(module, inputs, idx=idx, layer=layer):
+                # Dequant just this layer, inject into its real params.
+                weights = self._dequant_layer(idx)
+                for key, tensor in weights.items():
+                    short = key.replace(f"model.layers.{idx}.", "")
+                    parts = short.split(".")
+                    try:
+                        sub = layer
+                        for p in parts[:-1]:
+                            sub = getattr(sub, p)
+                        self._set_param(sub, parts[-1], tensor)
+                    except AttributeError:
+                        pass
+                return inputs
+
+            def post_hook(module, inputs, output, idx=idx, layer=layer):
+                # Free this layer's fp16 weights right after it's done —
+                # the compressed original in self.cache_layers is untouched.
+                # Replace each real Parameter with a tiny empty one (not
+                # meta — meta tensors can trigger the same set_data
+                # incompatibility on the NEXT pre_hook injection).
+                for sub_module in layer.modules():
+                    for pname, p in list(sub_module._parameters.items()):
+                        if p is not None and p.numel() > 0:
+                            empty = torch.empty(0, device=p.device, dtype=p.dtype)
+                            sub_module._parameters[pname] = torch.nn.Parameter(
+                                empty, requires_grad=False
+                            )
+                if DEVICE == "cuda":
+                    torch.cuda.empty_cache()
+                return output
+
+            layer.register_forward_pre_hook(pre_hook)
+            layer.register_forward_hook(post_hook)
+
+    def reset_cache(self):
+        self.past_key_values = None
+
+    def forward(self, input_ids):
+        if not hasattr(self, "past_key_values"):
+            self.reset_cache()
+        with torch.no_grad():
+            out = self.model(
+                input_ids.to(DEVICE),
+                past_key_values=self.past_key_values,
+                use_cache=True,
             )
-        shard_files = ["model.safetensors"]
-
-    if verbose:
-        print(f"  Splitting {len(shard_files)} shard(s) into per-layer files...")
-
-    layer_pat = re.compile(r"model\.layers\.(\d+)\.")
-    layer_tensors = defaultdict(dict)
-    static_tensors = {}
-
-    for shard_name in shard_files:
-        shard_path = os.path.join(snapshot_dir, shard_name)
-        with safe_open(shard_path, framework="pt") as f:
-            for key in f.keys():
-                tensor = f.get_tensor(key)
-                m = layer_pat.search(key)
-                if m:
-                    layer_tensors[int(m.group(1))][key] = tensor
-                else:
-                    static_tensors[key] = tensor
-
-    for idx, tensors in layer_tensors.items():
-        out_path = os.path.join(split_dir, f"model.layers.{idx}.safetensors")
-        save_file(tensors, out_path)
-
-    if static_tensors:
-        save_file(static_tensors, os.path.join(split_dir, "static.safetensors"))
-
-    if verbose:
-        print(f"  ✅ Split {len(layer_tensors)} layers → {split_dir}")
-
-    return split_dir
-
-
-def _ensure_hf_model(model_id: str, verbose: bool = True) -> str:
-    """
-    Make sure the model is downloaded and split in HF cache.
-    Returns path to splitted_model directory.
-    """
-    # Check if already in cache
-    cached = get_hf_cache_dir(model_id)
-    if cached:
-        if verbose:
-            print(f"  ✅ Found in HF cache: {cached}")
-        return cached
-
-    if verbose:
-        print(f"  Downloading {model_id} from HuggingFace...\n")
-
-    from huggingface_hub import snapshot_download
-    snapshot_dir = snapshot_download(model_id)
-
-    split_dir = _split_model_layers(snapshot_dir, verbose=verbose)
-
-    cached = get_hf_cache_dir(model_id)
-    if cached:
-        return cached
-    return split_dir
-
-
-def _ensure_flyllm_model(model_id: str, hf_dir: str,
-                          verbose: bool = True) -> str:
-    """
-    Make sure the compressed FlyLLM model exists.
-    Returns path to ~/flyllmmodel/ModelName directory.
-    """
-    flyllm_dir = get_flyllm_dir(model_id)
-    meta_path  = os.path.join(flyllm_dir, "flyllm_meta.json")
-
-    if os.path.exists(meta_path):
-        # Check if all layer files exist
-        with open(meta_path) as f:
-            meta = json.load(f)
-        layer0 = os.path.join(flyllm_dir, "model.layers.0.safetensors")
-        if os.path.exists(layer0):
-            if verbose:
-                print(f"  ✅ Found compressed model: {flyllm_dir}")
-                print(f"     {meta['avg_bits']} bits avg  |  "
-                      f"{meta['size_reduction']}% smaller  |  "
-                      f"{meta['float16_layers']} float16  "
-                      f"{meta['int8_layers']} int8  "
-                      f"{meta['int4_layers']} int4\n")
-            return flyllm_dir
-
-    # Profile + quantize
-    if verbose:
-        print(f"\n  Profiling layers...\n")
-
-    cfg         = load_config(model_id)
-    profile     = profile_model(
-        model_id,
-        hf_dir=hf_dir,
-        output_path=os.path.join(flyllm_dir, "flyllm_profile.json"),
-        verbose=verbose,
-    )
-
-    if verbose:
-        print(f"\n  Quantizing layers...\n")
-
-    quantize_model(
-        model_id=model_id,
-        hf_dir=hf_dir,
-        profile=profile,
-        output_dir=flyllm_dir,
-        verbose=verbose,
-    )
-
-    return flyllm_dir
-
-
-class FlyLLM:
-    """
-    Main FlyLLM interface.
-
-    # Fully automatic — checks cache, downloads if needed, quantizes if needed
-    model = FlyLLM.from_pretrained("mistralai/Mistral-7B-v0.1")
-    print(model.generate("What is AI?"))
-
-    # Load already-compressed model directly
-    model = FlyLLM.load("~/flyllmmodel/Mistral-7B-v0.1")
-    """
-
-    def __init__(self, engine, cfg: ModelConfig, tokenizer):
-        self.engine    = engine
-        self.cfg       = cfg
-        self.tokenizer = tokenizer
-        self._history  = []
-        self._system   = None
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_id: str,
-        verbose:  bool = True,
-    ) -> "FlyLLM":
-        """
-        Full automatic pipeline:
-        1. Check HF cache → download if needed
-        2. Check ~/flyllmmodel → profile + quantize if needed
-        3. Load into RAM and return
-        """
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"  FlyLLM — {model_id}")
-            print(f"{'='*60}\n")
-
-        # Step 1 — HF cache
-        hf_dir = _ensure_hf_model(model_id, verbose=verbose)
-
-        # Step 2 — FlyLLM compressed model
-        flyllm_dir = _ensure_flyllm_model(model_id, hf_dir, verbose=verbose)
-
-        # Step 3 — Load
-        return cls._load(model_id, flyllm_dir, hf_dir, verbose=verbose)
-
-    @classmethod
-    def load(cls, flyllm_dir: str, verbose: bool = True) -> "FlyLLM":
-        """Load directly from a flyllm model directory."""
-        flyllm_dir = os.path.expanduser(flyllm_dir)
-        meta_path  = os.path.join(flyllm_dir, "flyllm_meta.json")
-
-        if not os.path.exists(meta_path):
-            raise ValueError(
-                f"{flyllm_dir} is not a FlyLLM model directory. "
-                "Run FlyLLM.from_pretrained() first."
-            )
-
-        with open(meta_path) as f:
-            meta = json.load(f)
-
-        model_id = meta["model_id"]
-        hf_dir   = meta["hf_dir"]
-
-        if not os.path.isdir(hf_dir):
-            raise FileNotFoundError(
-                f"Original HF model not found at: {hf_dir}\n"
-                "The static weights (embed, norm, lm_head) are needed from the original."
-            )
-
-        if verbose:
-            print(f"\n  Loading FlyLLM — {model_id}")
-            print(f"  {meta['avg_bits']} bits avg  |  "
-                  f"{meta['size_reduction']}% smaller  |  "
-                  f"{meta['float16_layers']} float16  "
-                  f"{meta['int8_layers']} int8  "
-                  f"{meta['int4_layers']} int4\n")
-
-        return cls._load(model_id, flyllm_dir, hf_dir, verbose=verbose)
-
-    @classmethod
-    def _load(cls, model_id, flyllm_dir, hf_dir, verbose=True):
-        cfg       = load_config(model_id)
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        engine    = get_engine(flyllm_dir, hf_dir, cfg, verbose=verbose)
-        return cls(engine, cfg, tokenizer)
-
-    # ── Generation ────────────────────────────────────────────
-
-    def generate(
-        self,
-        prompt:         str,
-        system:         Optional[str] = None,
-        max_new_tokens: int   = 512,
-        temperature:    float = 0.7,
-        top_p:          float = 0.9,
-    ) -> str:
-        messages  = [{"role": "user", "content": prompt}]
-        formatted = format_prompt(messages, self.cfg, system or self._system)
-        input_ids = self.tokenizer(formatted, return_tensors="pt")["input_ids"]
-        stop_ids = self.tokenizer("[INST]", add_special_tokens=False)["input_ids"]
-
-        tokens    = list(self.engine.generate_tokens(
-            input_ids, max_new_tokens=max_new_tokens,
-            temperature=temperature, top_p=top_p,
-            tokenizer=self.tokenizer,
-            stop_ids=stop_ids,
-        ))
-        return self.tokenizer.decode(tokens, skip_special_tokens=True)
-
-    def stream(
-        self,
-        prompt:         str,
-        system:         Optional[str] = None,
-        max_new_tokens: int   = 512,
-        temperature:    float = 0.7,
-        top_p:          float = 0.9,
-    ) -> Iterator[str]:
-        messages  = [{"role": "user", "content": prompt}]
-        formatted = format_prompt(messages, self.cfg, system or self._system)
-        input_ids = self.tokenizer(formatted, return_tensors="pt")["input_ids"]
-        for token_id in self.engine.generate_tokens(
-            input_ids, max_new_tokens=max_new_tokens,
-            temperature=temperature, top_p=top_p, stream=True,
-            tokenizer=self.tokenizer,
-        ):
-            yield self.tokenizer.decode([token_id], skip_special_tokens=True)
-
-    def chat_turn(self, user_msg: str, max_new_tokens: int = 512,
-                  temperature: float = 0.7) -> str:
-        self._history.append({"role": "user", "content": user_msg})
-        formatted = format_prompt(self._history, self.cfg, self._system)
-        input_ids = self.tokenizer(formatted, return_tensors="pt")["input_ids"]
-        tokens    = list(self.engine.generate_tokens(
-            input_ids, max_new_tokens=max_new_tokens, temperature=temperature,
-            tokenizer=self.tokenizer,
-        ))
-        response  = self.tokenizer.decode(tokens, skip_special_tokens=True)
-        self._history.append({"role": "assistant", "content": response})
-        return response
-
-    def set_system(self, system: str):
-        self._system = system
-
-    def reset_history(self):
-        self._history = []
-
-    def __repr__(self):
-        return f"FlyLLM(model={self.cfg.model_type}, layers={self.cfg.num_hidden_layers})"
+        self.past_key_values = out.past_key_values
+        return out.logits
