@@ -47,6 +47,12 @@ class HFEngine(BaseEngine):
         )
         self.model.eval()
 
+        # RoPE's inv_freq buffer is computed from config, not loaded
+        # from the checkpoint — but under device_map="meta" it's still
+        # created as a meta tensor with no real data. Fix it now,
+        # before anything tries to use it.
+        self._fix_rotary_buffers()
+
         # Keep compressed layers RAW in RAM — never dequantized here.
         # This dict is the only place the model's decoder weights live
         # persistently; it stays populated for the whole session.
@@ -76,6 +82,28 @@ class HFEngine(BaseEngine):
         if self.verbose:
             print(f"  Model ready — layers stay compressed, "
                   f"decompressed on demand per forward call.")
+
+    def _fix_rotary_buffers(self):
+        """inv_freq is computed from config (not loaded from checkpoint),
+        but under device_map='meta' it's created as a meta tensor too and
+        never gets real values assigned. Recompute it directly from the
+        standard RoPE formula and replace the buffer object (same trick
+        as _set_param, to avoid the meta-tensor copy error)."""
+        cfg = self.cfg
+        head_dim = getattr(cfg, "head_dim", None) or (
+            cfg.hidden_size // cfg.num_attention_heads
+        )
+        base = cfg.rope_theta
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        for name, _ in list(self.model.named_buffers()):
+            if name.endswith("inv_freq"):
+                module = self.model
+                parts = name.split(".")
+                for p in parts[:-1]:
+                    module = getattr(module, p)
+                module._buffers[parts[-1]] = inv_freq.to(DEVICE)
 
     def _set_param(self, module, name, tensor):
         """Replace a (possibly meta) Parameter with a real one, or set
