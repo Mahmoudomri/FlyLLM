@@ -89,20 +89,26 @@ class HFEngine(BaseEngine):
             setattr(module, name, tensor)
 
     def _load_static_weights(self):
-        for name in ["model.embed_tokens", "model.norm", "lm_head"]:
-            path = os.path.join(self.hf_dir, f"{name}.safetensors")
-            if not os.path.exists(path):
-                continue
-            d = load_file(path, device="cpu")
-            for key, tensor in d.items():
-                parts  = key.split(".")
-                module = self.model
-                try:
-                    for p in parts[:-1]:
-                        module = getattr(module, p)
-                    self._set_param(module, parts[-1], tensor.to(DTYPE).to(DEVICE))
-                except AttributeError:
-                    pass
+        # embed_tokens, norm, and lm_head are all saved together in a
+        # single static.safetensors file by the splitter (loader.py),
+        # not as three separate files — this must match that layout.
+        path = os.path.join(self.hf_dir, "static.safetensors")
+        if not os.path.exists(path):
+            if self.verbose:
+                print(f"  WARNING: static.safetensors not found at {path} — "
+                      f"embed/norm/lm_head will stay uninitialized (meta)!")
+            return
+        d = load_file(path, device="cpu")
+        for key, tensor in d.items():
+            parts  = key.split(".")
+            module = self.model
+            try:
+                for p in parts[:-1]:
+                    module = getattr(module, p)
+                self._set_param(module, parts[-1], tensor.to(DTYPE).to(DEVICE))
+            except AttributeError:
+                if self.verbose:
+                    print(f"  WARNING: could not set static param {key}")
 
     def _dequant_layer(self, idx):
         """Dequantize one layer's compressed tensors to fp16 on DEVICE.
