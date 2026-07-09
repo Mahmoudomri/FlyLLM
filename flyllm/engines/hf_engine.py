@@ -8,6 +8,13 @@ during its own forward pass (via a pre-hook), and freed immediately
 after (via a post-hook). At any given moment only ONE layer's worth
 of fp16 weights exists on the GPU/CPU, instead of the whole model.
 
+NOTE: the model is built with device_map="meta", so its parameters
+start as meta tensors (no real storage). Meta tensors are a distinct
+type from real tensors, so PyTorch refuses `param.data = real_tensor`
+(RuntimeError: incompatible tensor type). The fix is to replace the
+Parameter object itself in the module's `_parameters` dict instead of
+mutating `.data` on the existing (meta) Parameter.
+
 Trade-off: every layer is re-dequantized on every single forward call
 (every token), which costs CPU/transfer time each step. This trades
 speed for RAM/VRAM footprint — it does not make generation faster,
@@ -57,7 +64,9 @@ class HFEngine(BaseEngine):
             print(f"\n  All {cfg.num_hidden_layers} layers in RAM (compressed).")
 
         # Static weights (embed/norm/lm_head) need real values loaded
-        # once — they're small relative to the decoder stack.
+        # once — they're small relative to the decoder stack. These
+        # also start as meta tensors and need the same _parameters
+        # replacement trick, not a .data assignment.
         self._load_static_weights()
 
         # Attach hooks: dequant-inject before each layer runs,
@@ -67,6 +76,17 @@ class HFEngine(BaseEngine):
         if self.verbose:
             print(f"  Model ready — layers stay compressed, "
                   f"decompressed on demand per forward call.")
+
+    def _set_param(self, module, name, tensor):
+        """Replace a (possibly meta) Parameter with a real one, or set
+        a plain buffer/attribute. Works regardless of whether the
+        current value is a meta tensor or a real one."""
+        if name in module._parameters:
+            module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=False)
+        elif name in module._buffers:
+            module._buffers[name] = tensor
+        else:
+            setattr(module, name, tensor)
 
     def _load_static_weights(self):
         for name in ["model.embed_tokens", "model.norm", "lm_head"]:
@@ -80,8 +100,7 @@ class HFEngine(BaseEngine):
                 try:
                     for p in parts[:-1]:
                         module = getattr(module, p)
-                    param = getattr(module, parts[-1])
-                    param.data = tensor.to(DTYPE).to(DEVICE)
+                    self._set_param(module, parts[-1], tensor.to(DTYPE).to(DEVICE))
                 except AttributeError:
                     pass
 
@@ -90,7 +109,7 @@ class HFEngine(BaseEngine):
         Reads only from self.cache_layers[idx] (RAM, compressed) —
         never mutates it, so the same compressed copy is reused
         every single token."""
-        raw  = self.cache_layers.get(idx)
+        raw = self.cache_layers.get(idx)
         if raw is None:
             return {}
         main = [k for k in raw if not any(
@@ -128,11 +147,7 @@ class HFEngine(BaseEngine):
                         sub = layer
                         for p in parts[:-1]:
                             sub = getattr(sub, p)
-                        param = getattr(sub, parts[-1])
-                        if isinstance(param, torch.nn.Parameter):
-                            param.data = tensor
-                        else:
-                            setattr(sub, parts[-1], tensor)
+                        self._set_param(sub, parts[-1], tensor)
                     except AttributeError:
                         pass
                 return inputs
@@ -140,8 +155,16 @@ class HFEngine(BaseEngine):
             def post_hook(module, inputs, output, idx=idx, layer=layer):
                 # Free this layer's fp16 weights right after it's done —
                 # the compressed original in self.cache_layers is untouched.
-                for param in layer.parameters(recurse=True):
-                    param.data = torch.empty(0, device=param.device, dtype=param.dtype)
+                # Replace each real Parameter with a tiny empty one (not
+                # meta — meta tensors can trigger the same set_data
+                # incompatibility on the NEXT pre_hook injection).
+                for sub_module in layer.modules():
+                    for pname, p in list(sub_module._parameters.items()):
+                        if p is not None and p.numel() > 0:
+                            empty = torch.empty(0, device=p.device, dtype=p.dtype)
+                            sub_module._parameters[pname] = torch.nn.Parameter(
+                                empty, requires_grad=False
+                            )
                 if DEVICE == "cuda":
                     torch.cuda.empty_cache()
                 return output
