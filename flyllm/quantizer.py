@@ -42,6 +42,13 @@ def quantize_tensor(tensor: torch.Tensor, precision: str):
         scales = scales.clamp(min=1e-8)
         q      = (blocks / scales.unsqueeze(1)).round().clamp(-8, 7).to(torch.int8)
 
+        # pack two int4 values per byte (nibble packing) — this is the
+        # actual fix: without this, int4 was stored 1 value/byte, same
+        # as int8, giving zero size benefit over int8 on disk.
+        q_u    = (q.flatten() + 8).to(torch.uint8)      # shift to unsigned 0..15
+        packed = (q_u[1::2] << 4) | q_u[0::2]            # pack pairs into 1 byte
+        q      = packed.contiguous()                     # uint8, HALF the length
+
     meta = {
         "scales": scales.half(),
         "shape":  torch.tensor(list(orig) + [pad], dtype=torch.int32),
@@ -56,10 +63,26 @@ def dequantize_tensor(q: torch.Tensor, meta: Optional[dict],
                       dtype=torch.float16) -> torch.Tensor:
     if meta is None:
         return q.to(dtype)
+
     scales     = meta["scales"].float()
     shape_data = meta["shape"].tolist()
     orig_shape, pad = shape_data[:-1], shape_data[-1]
-    flat = (q.float() * scales.unsqueeze(1)).flatten()
+    prec = int(meta["prec"].item())  # 0=float16, 1=int8, 2=int4
+
+    if prec == 2:
+        # unpack nibbles back to signed int4 values (-8..7)
+        packed   = q  # uint8, half length of the original block data
+        low      = (packed & 0x0F).to(torch.int16) - 8
+        high     = ((packed >> 4) & 0x0F).to(torch.int16) - 8
+        unpacked = torch.empty(packed.numel() * 2, dtype=torch.int16)
+        unpacked[0::2] = low
+        unpacked[1::2] = high
+        n_blocks = scales.numel()
+        blocks   = unpacked.float().reshape(n_blocks, -1)
+    else:
+        blocks = q.float()
+
+    flat = (blocks * scales.unsqueeze(1)).flatten()
     if pad:
         flat = flat[:-pad]
     return flat.reshape(orig_shape).to(dtype)
