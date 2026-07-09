@@ -15,17 +15,26 @@ type from real tensors, so PyTorch refuses `param.data = real_tensor`
 Parameter object itself in the module's `_parameters` dict instead of
 mutating `.data` on the existing (meta) Parameter.
 
-Trade-off: every layer is re-dequantized on every single forward call
-(every token), which costs CPU/transfer time each step. This trades
-speed for RAM/VRAM footprint — it does not make generation faster,
-it makes it fit in less memory.
+Pipelined prefetch: while the GPU is busy running layer N's forward
+matmuls (main CUDA stream), layer N+1's dequant runs concurrently on
+a SEPARATE CUDA stream. By the time layer N finishes, N+1's weights
+are often already sitting in fp16 ready to use — so the dequant cost
+is hidden behind the compute cost instead of adding to it. On CPU-only
+setups there are no streams, so this degrades gracefully to inline
+(non-overlapped) dequant.
+
+Trade-off: every layer is still re-dequantized on every single forward
+call (every token) — that repeated work doesn't go away, and RAM/VRAM
+footprint stays low (at most ~2 layers' worth of fp16 weights exist at
+once: the one currently running + the one being prefetched). What the
+pipeline buys back is wall-clock time, by overlapping dequant with
+compute instead of doing them strictly back to back.
 """
 import os
 import torch
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM
 from .base import BaseEngine
-from ..quantizer import dequantize_tensor
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE  = torch.float16
@@ -79,9 +88,29 @@ class HFEngine(BaseEngine):
         # free right after it's done.
         self._attach_lazy_hooks()
 
+        # Pipelining state: a second CUDA stream lets us dequant layer
+        # N+1 WHILE the GPU is still busy computing layer N's matmuls,
+        # instead of doing dequant-then-compute strictly back to back.
+        # On CPU-only setups there's no stream concept, so this is a
+        # no-op and behaves like the non-pipelined version.
+        self._dequant_stream    = torch.cuda.Stream() if DEVICE == "cuda" else None
+        self._prefetch_cache    = {}   # idx -> dequantized weights, ready to use
+        self._prefetch_events   = {}   # idx -> cuda.Event signaling "dequant done"
+
+        # torch.cuda.empty_cache() forces a full device sync — calling
+        # it on EVERY layer defeats the pipeline (it blocks until the
+        # background dequant stream is fully caught up, which is
+        # exactly the wait we're trying to hide). Instead, only free
+        # every EMPTY_CACHE_EVERY layers — frequent enough to avoid
+        # fragmentation OOMs on small GPUs, rare enough to preserve
+        # most of the overlap. Set to 1 to restore the old per-layer
+        # behavior if you hit memory issues.
+        self.EMPTY_CACHE_EVERY = 8
+
         if self.verbose:
             print(f"  Model ready — layers stay compressed, "
-                  f"decompressed on demand per forward call.")
+                  f"decompressed on demand per forward call "
+                  f"(pipelined prefetch: {'on' if self._dequant_stream else 'off'}).")
 
     def _fix_rotary_buffers(self):
         """inv_freq is computed from config (not loaded from checkpoint),
@@ -139,10 +168,21 @@ class HFEngine(BaseEngine):
                     print(f"  WARNING: could not set static param {key}")
 
     def _dequant_layer(self, idx):
-        """Dequantize one layer's compressed tensors to fp16 on DEVICE.
+        """Dequantize one layer's compressed tensors to fp16, with the
+        actual dequant MATH happening on DEVICE (GPU), not on CPU.
+
+        Old approach: dequant on CPU (slow Python/PyTorch-CPU tensor
+        ops), then transfer the big fp16 result to GPU.
+        New approach: transfer the small COMPRESSED bytes to GPU first
+        (cheap — int4 is ~4x smaller than fp16), then do the unpack +
+        scale multiply on GPU (CUDA tensor ops are much faster than
+        the same ops on CPU). Net effect: less data moved, and the
+        compute itself is faster.
+
         Reads only from self.cache_layers[idx] (RAM, compressed) —
         never mutates it, so the same compressed copy is reused
-        every single token."""
+        every single token.
+        """
         raw = self.cache_layers.get(idx)
         if raw is None:
             return {}
@@ -154,17 +194,69 @@ class HFEngine(BaseEngine):
             q  = raw[key]
             sk = f"{key}.__scales"
             if sk in raw:
-                meta = {
-                    "scales": raw[sk],
-                    "shape":  raw[f"{key}.__shape"],
-                    "prec":   raw[f"{key}.__prec"],
-                }
-                out[key] = dequantize_tensor(q, meta, DTYPE).to(DEVICE)
+                # Move compressed bytes + scales to GPU BEFORE dequanting —
+                # this is the key change vs the CPU-side version.
+                q_dev      = q.to(DEVICE, non_blocking=True)
+                scales_dev = raw[sk].to(DEVICE, non_blocking=True).float()
+                shape_data = raw[f"{key}.__shape"].tolist()
+                prec       = int(raw[f"{key}.__prec"].item())
+                orig_shape, pad = shape_data[:-1], shape_data[-1]
+
+                if prec == 2:  # int4, nibble-packed
+                    packed = q_dev  # uint8, half length
+                    low    = (packed & 0x0F).to(torch.int16) - 8
+                    high   = ((packed >> 4) & 0x0F).to(torch.int16) - 8
+                    unpacked = torch.empty(
+                        packed.numel() * 2, dtype=torch.int16, device=DEVICE
+                    )
+                    unpacked[0::2] = low
+                    unpacked[1::2] = high
+                    n_blocks = scales_dev.numel()
+                    blocks   = unpacked.float().reshape(n_blocks, -1)
+                else:  # int8
+                    blocks = q_dev.float()
+
+                flat = (blocks * scales_dev.unsqueeze(1)).flatten()
+                if pad:
+                    flat = flat[:-pad]
+                out[key] = flat.reshape(orig_shape).to(DTYPE)
             else:
                 # float16 layers (e.g. L0, last layer) have no meta —
                 # already stored at full precision, just move+cast.
                 out[key] = q.to(DTYPE).to(DEVICE)
         return out
+
+    def _prefetch_layer(self, idx):
+        """Launch dequant of layer `idx` on the background stream, so
+        it runs concurrently with whatever the main stream is doing
+        (i.e. the current layer's forward matmuls). Result lands in
+        self._prefetch_cache[idx] once done; an Event lets pre_hook
+        wait for exactly that point instead of a full device sync."""
+        if idx >= self.cfg.num_hidden_layers or idx in self._prefetch_cache:
+            return
+        if self._dequant_stream is None:
+            # No CUDA streams available (CPU-only) — just do it inline.
+            self._prefetch_cache[idx] = self._dequant_layer(idx)
+            return
+        with torch.cuda.stream(self._dequant_stream):
+            self._prefetch_cache[idx] = self._dequant_layer(idx)
+            event = torch.cuda.Event()
+            event.record(self._dequant_stream)
+            self._prefetch_events[idx] = event
+
+    def _get_layer_weights(self, idx):
+        """Fetch layer idx's dequantized weights, waiting only if the
+        background prefetch for it hasn't finished yet. Falls back to
+        an inline (blocking) dequant if it was never prefetched at all
+        — e.g. layer 0 on the very first forward call."""
+        if idx not in self._prefetch_cache:
+            self._prefetch_layer(idx)
+        if self._dequant_stream is not None and idx in self._prefetch_events:
+            # Make the MAIN stream wait for the dequant stream to reach
+            # this point — cheap if it's already done, blocks briefly
+            # if the layer's forward pass was faster than its dequant.
+            torch.cuda.current_stream().wait_event(self._prefetch_events.pop(idx))
+        return self._prefetch_cache.pop(idx)
 
     def _attach_lazy_hooks(self):
         cfg = self.cfg
@@ -172,8 +264,11 @@ class HFEngine(BaseEngine):
             layer = self.model.model.layers[idx]
 
             def pre_hook(module, inputs, idx=idx, layer=layer):
-                # Dequant just this layer, inject into its real params.
-                weights = self._dequant_layer(idx)
+                # Grab this layer's weights — dequant may already be
+                # done in the background (prefetched during the
+                # PREVIOUS layer's forward pass), or done inline now
+                # if this is the very first layer.
+                weights = self._get_layer_weights(idx)
                 for key, tensor in weights.items():
                     short = key.replace(f"model.layers.{idx}.", "")
                     parts = short.split(".")
@@ -184,6 +279,11 @@ class HFEngine(BaseEngine):
                         self._set_param(sub, parts[-1], tensor)
                     except AttributeError:
                         pass
+
+                # Kick off dequant of the NEXT layer now, on the
+                # background stream, so it overlaps with THIS layer's
+                # upcoming forward compute instead of waiting for it.
+                self._prefetch_layer(idx + 1)
                 return inputs
 
             def post_hook(module, inputs, output, idx=idx, layer=layer):
@@ -199,7 +299,7 @@ class HFEngine(BaseEngine):
                             sub_module._parameters[pname] = torch.nn.Parameter(
                                 empty, requires_grad=False
                             )
-                if DEVICE == "cuda":
+                if DEVICE == "cuda" and (idx % self.EMPTY_CACHE_EVERY == 0):
                     torch.cuda.empty_cache()
                 return output
 
@@ -208,6 +308,11 @@ class HFEngine(BaseEngine):
 
     def reset_cache(self):
         self.past_key_values = None
+        # Drop any leftover prefetch state from a previous generation.
+        if hasattr(self, "_prefetch_cache"):
+            self._prefetch_cache.clear()
+        if hasattr(self, "_prefetch_events"):
+            self._prefetch_events.clear()
 
     def forward(self, input_ids):
         if not hasattr(self, "past_key_values"):
