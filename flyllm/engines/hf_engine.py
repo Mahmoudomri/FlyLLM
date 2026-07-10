@@ -269,6 +269,24 @@ class HFEngine(BaseEngine):
                 # PREVIOUS layer's forward pass), or done inline now
                 # if this is the very first layer.
                 weights = self._get_layer_weights(idx)
+
+                # IMPORTANT: these tensors were produced on the
+                # background dequant stream but are about to be read
+                # by the MAIN stream (this layer's forward matmuls).
+                # The cuda.Event wait already guarantees correct
+                # ORDERING of the compute, but PyTorch's caching
+                # allocator can still reuse the underlying memory
+                # blocks for a new allocation on the dequant stream
+                # (e.g. prefetching layer idx+2 later) before the main
+                # stream is done reading — silent corruption (NaNs in
+                # logits) rather than a clean crash. record_stream()
+                # tells the allocator "the current stream still needs
+                # this memory", preventing that premature reuse.
+                if DEVICE == "cuda":
+                    current = torch.cuda.current_stream()
+                    for t in weights.values():
+                        t.record_stream(current)
+
                 for key, tensor in weights.items():
                     short = key.replace(f"model.layers.{idx}.", "")
                     parts = short.split(".")
