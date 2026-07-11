@@ -247,35 +247,47 @@ def profile_model(
     all_scores = [r["score"] for r in raw_results]
 
     # ---- Pass 2: adaptive precision assignment ------------------------------
-    # VARIANT: unlike the edge-exclusion version, here L0 and L_last DO
-    # participate in the k-means computation — their scores influence the
-    # median/MAD and the clustering exactly like every other layer. The
-    # only difference from the original (no-exclusion) version is that,
-    # AFTER clustering, their assigned precision is forcibly overridden to
-    # float16 — regardless of which cluster k-means happened to place them
-    # in. This tests whether the "compute WITH them, decide WITHOUT them"
-    # framing (excluding them from clustering) matters, versus simply
-    # "compute with them, then always override their own result to
-    # float16" — a cheaper, simpler rule with a different side effect: the
-    # middle layers are still clustered against the SAME skewed score range
-    # as the original version (L0/L_last still pull the median/MAD), so
-    # this variant is NOT expected to fix the France-hallucination case the
-    # same way edge-exclusion did — it's here to test that expectation.
+    # First and last layers are consistently the extreme outliers across
+    # every architecture profiled so far (Mistral: L0 kurtosis 20.5 vs ~4
+    # baseline; L31 11.4 vs ~4 — same bookend pattern seen on other models).
+    # Leaving them IN the clustering computation drags the median/MAD and
+    # compresses the score range for every other layer, making it harder
+    # for k-means to find real structure among the middle layers (on
+    # Mistral this produced 29/32 layers dumped into a single int4 bucket
+    # with almost no separation between them).
+    #
+    # Fix: force the first and last layer to float16 directly — skip them
+    # entirely, they never enter the array k-means clusters on. This is a
+    # fixed RULE (not a fixed threshold): it's justified by data observed
+    # across multiple models, not a guessed cutoff value. k stays at 3 for
+    # the middle layers — more resolution there is strictly better, not
+    # worse, and 3 remains tied to the number of bit-width tiers FlyLLM
+    # offers, not an arbitrary tuning knob.
     n_layers = len(layer_indices)
 
-    precisions = assign_precisions(all_scores)
+    if n_layers <= 2:
+        # Too few layers to meaningfully separate edges from a "middle" —
+        # fall back to clustering everything together as before.
+        precisions = assign_precisions(all_scores)
+    else:
+        middle_positions = list(range(1, n_layers - 1))
+        middle_scores    = [all_scores[i] for i in middle_positions]
 
-    if n_layers > 2:
-        precisions[0]  = "float16"
-        precisions[-1] = "float16"
+        middle_precisions = assign_precisions(middle_scores)
+
+        precisions = ["float16"] * n_layers
+        for local_i, pos in enumerate(middle_positions):
+            precisions[pos] = middle_precisions[local_i]
+        # precisions[0] and precisions[-1] stay "float16" — set above,
+        # never touched by the clustering.
 
     if verbose:
         median_s, mad, scaled_mad = _robust_z(np.array(all_scores))
         print(f"  Pass 2/2 : adaptive tiering "
               f"(median={median_s:.4f}, scaled_MAD={scaled_mad:.4f})")
         if n_layers > 2:
-            print(f"             L0 and L{n_layers-1} INCLUDED in k-means, "
-                  f"then forced to float16 (override rule)\n")
+            print(f"             L0 and L{n_layers-1} forced to float16, "
+                  f"excluded from k-means (edge-outlier rule)\n")
         else:
             print()
         print(f"  {'L':<5} {'Kurt':>8} {'Entrop':>8} {'MaxAbs':>8} "
@@ -321,7 +333,7 @@ def profile_model(
         "score_min":      round(min(all_scores), 4),
         "score_max":      round(max(all_scores), 4),
         "score_median":   round(float(np.median(all_scores)), 4),
-        "tiering_method": "kmeans_1d_k3_edges_overridden",  # documents HOW tiers were picked
+        "tiering_method": "kmeans_1d_k3_edges_excluded",  # documents HOW tiers were picked
     }
 
     if verbose:
