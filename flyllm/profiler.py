@@ -3,11 +3,20 @@ FlyLLM - Layer Sensitivity Profiler
 3 metrics: Kurtosis + Entropy + MaxAbs
 Zero calibration data needed.
 
-CHANGE FROM PREVIOUS VERSION:
+CHANGE FROM PREVIOUS VERSION (2):
 Fixed thresholds (THRESHOLD_FLOAT16 / THRESHOLD_INT8) are REMOVED.
 Tier boundaries (float16 / int8 / int4) are now derived per-model, per-run
-using robust z-scores (median/MAD) + largest-gap ("knee") detection on the
-sorted score distribution. No architecture, no hardcoded SCORE cutoff.
+using 1D k-means (k=3) on the sorted score distribution. No architecture,
+no hardcoded SCORE cutoff.
+
+CHANGE FROM PREVIOUS VERSION (3):
+The first and last layers are excluded from the clustering computation and
+forced to float16 directly. Both are consistently extreme outliers across
+every architecture profiled so far, and leaving them in the score array
+drags the median/MAD and compresses the effective score range for every
+other layer — making it harder for k-means to separate the middle layers
+from each other. This is a fixed RULE (always float16 at the edges),
+justified by data observed across models, not a guessed SCORE threshold.
 """
 
 import os
@@ -237,13 +246,50 @@ def profile_model(
 
     all_scores = [r["score"] for r in raw_results]
 
-    # ---- Pass 2: adaptive precision assignment across the whole model ------
-    precisions = assign_precisions(all_scores)
+    # ---- Pass 2: adaptive precision assignment ------------------------------
+    # First and last layers are consistently the extreme outliers across
+    # every architecture profiled so far (Mistral: L0 kurtosis 20.5 vs ~4
+    # baseline; L31 11.4 vs ~4 — same bookend pattern seen on other models).
+    # Leaving them IN the clustering computation drags the median/MAD and
+    # compresses the score range for every other layer, making it harder
+    # for k-means to find real structure among the middle layers (on
+    # Mistral this produced 29/32 layers dumped into a single int4 bucket
+    # with almost no separation between them).
+    #
+    # Fix: force the first and last layer to float16 directly — skip them
+    # entirely, they never enter the array k-means clusters on. This is a
+    # fixed RULE (not a fixed threshold): it's justified by data observed
+    # across multiple models, not a guessed cutoff value. k stays at 3 for
+    # the middle layers — more resolution there is strictly better, not
+    # worse, and 3 remains tied to the number of bit-width tiers FlyLLM
+    # offers, not an arbitrary tuning knob.
+    n_layers = len(layer_indices)
+
+    if n_layers <= 2:
+        # Too few layers to meaningfully separate edges from a "middle" —
+        # fall back to clustering everything together as before.
+        precisions = assign_precisions(all_scores)
+    else:
+        middle_positions = list(range(1, n_layers - 1))
+        middle_scores    = [all_scores[i] for i in middle_positions]
+
+        middle_precisions = assign_precisions(middle_scores)
+
+        precisions = ["float16"] * n_layers
+        for local_i, pos in enumerate(middle_positions):
+            precisions[pos] = middle_precisions[local_i]
+        # precisions[0] and precisions[-1] stay "float16" — set above,
+        # never touched by the clustering.
 
     if verbose:
         median_s, mad, scaled_mad = _robust_z(np.array(all_scores))
         print(f"  Pass 2/2 : adaptive tiering "
-              f"(median={median_s:.4f}, scaled_MAD={scaled_mad:.4f})\n")
+              f"(median={median_s:.4f}, scaled_MAD={scaled_mad:.4f})")
+        if n_layers > 2:
+            print(f"             L0 and L{n_layers-1} forced to float16, "
+                  f"excluded from k-means (edge-outlier rule)\n")
+        else:
+            print()
         print(f"  {'L':<5} {'Kurt':>8} {'Entrop':>8} {'MaxAbs':>8} "
               f"{'SCORE':>8}  {'Bar':<22} Precision")
         print(f"  {'-'*75}")
@@ -287,7 +333,7 @@ def profile_model(
         "score_min":      round(min(all_scores), 4),
         "score_max":      round(max(all_scores), 4),
         "score_median":   round(float(np.median(all_scores)), 4),
-        "tiering_method": "robust_z_gap_detection",  # documents HOW tiers were picked
+        "tiering_method": "kmeans_1d_k3_edges_excluded",  # documents HOW tiers were picked
     }
 
     if verbose:
