@@ -41,8 +41,6 @@ def _max_abs(flat: torch.Tensor) -> float:
 
 def _raw_layer_stats(tensors: dict) -> dict:
     """Compute raw kurt/entropy/max_abs + weighted SCORE for one layer.
-    Precision is NOT assigned here anymore — that happens after all
-    layers are scored, so tiering can be calibrated against the whole model.
     """
     all_vals = []
     for tensor in tensors.values():
@@ -96,11 +94,7 @@ def _robust_z(scores: np.ndarray) -> tuple[np.ndarray, float, float]:
 
 def _kmeans_1d(values: np.ndarray, k: int, n_iter: int = 200) -> tuple:
     """
-    Plain 1D k-means (Lloyd's algorithm). This is the standard, well-behaved
-    way to split 1D data into k natural groups — equivalent in spirit to
-    Jenks Natural Breaks (used for choropleth map classification), which is
-    exactly this problem: bucket a 1D score column into a small number of
-    meaningfully-different groups.
+    Plain 1D k-means (Lloyd's algorithm).
     """
     values = np.asarray(values, dtype=float)
     n = len(values)
@@ -134,15 +128,7 @@ def _kmeans_1d(values: np.ndarray, k: int, n_iter: int = 200) -> tuple:
 
 def assign_precisions(scores: list) -> list:
     """
-    Fully self-calibrating precision assignment. No fixed SCORE thresholds
-    anywhere — the only "parameter" is k=3, and that's not a calibration
-    knob, it's simply the number of bit-width tiers FlyLLM offers
-    (float16 / int8 / int4). Every boundary between those 3 groups is
-    derived from this model's own SCORE column at call time via k-means.
-
-    Cluster with the highest mean score -> float16
-    Cluster with the middle mean score  -> int8
-    Cluster with the lowest mean score  -> int4
+    Fully self-calibrating precision assignment via k-means.
     """
     arr = np.array(scores, dtype=float)
     n = len(arr)
