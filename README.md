@@ -60,19 +60,19 @@ precision more accurately where it is needed.
 
 ```bash
 # Auto-download, profile, quantize, run — one command
-flyllm run Qwen/Qwen2.5-7B-Instruct --prompt "What is AI?"
+flyllm run mistralai/Mistral-7B-Instruct-v0.3 --prompt "What is AI?"
 
 # Interactive chat
-flyllm chat microsoft/Phi-3-mini-4k-instruct
+flyllm chat  mistralai/Mistral-7B-Instruct-v0.3
 
 # With system prompt
-flyllm chat Qwen/Qwen2.5-7B-Instruct --system "You are a Python expert."
+flyllm chat  mistralai/Mistral-7B-Instruct-v0.3 --system "You are a Python expert."
 
 # Profile only — see layer analysis without quantizing
 flyllm profile mistralai/Mistral-7B-Instruct-v0.3
 
 # Quantize only
-flyllm quantize microsoft/Phi-3-mini-4k-instruct
+flyllm quantize mistralai/Mistral-7B-Instruct-v0.3
 ```
 
 ### Python API
@@ -100,7 +100,7 @@ model.chat_turn("What's the difference between int8 and int4 quantization?")
 model.chat_turn("Which one loses more accuracy, and why?")  # remembers context
 
 # Load an already-quantized model directly, skip the from_pretrained checks
-model = FlyLLM.load("~/flyllmmodel/Phi-3-mini-4k-instruct")
+model = FlyLLM.load("~/flyllmmodel/Qwen2.5-7B-Instruct")
 ```
 
 ---
