@@ -1,6 +1,6 @@
 # FlyLLM 🚀 — Precision Where It Counts
 
-**Sensitivity-Aware Mixed-Precision Quantization for Memory-Efficient LLM Inference**
+**Sensitivity-Aware Mixed-Precision Quantization for Memory-Efficient LLM Inference .**
 
 FlyLLM profiles every layer of a model with three zero-calibration metrics
 and assigns each one its own precision (float16 / int8 / int4), instead of
