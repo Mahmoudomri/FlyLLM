@@ -1,6 +1,6 @@
 """
 FlyLLM - HuggingFace Fallback Engine
-For any model not covered by custom engines (Phi, Qwen2, Falcon, etc.)
+For any model (Mistral,Llama,Phi, Qwen2, Falcon, etc.)
 """
 import os
 import torch
