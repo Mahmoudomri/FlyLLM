@@ -3,20 +3,6 @@ FlyLLM - Layer Sensitivity Profiler
 3 metrics: Kurtosis + Entropy + MaxAbs
 Zero calibration data needed.
 
-CHANGE FROM PREVIOUS VERSION (2):
-Fixed thresholds (THRESHOLD_FLOAT16 / THRESHOLD_INT8) are REMOVED.
-Tier boundaries (float16 / int8 / int4) are now derived per-model, per-run
-using 1D k-means (k=3) on the sorted score distribution. No architecture,
-no hardcoded SCORE cutoff.
-
-CHANGE FROM PREVIOUS VERSION (3):
-The first and last layers are excluded from the clustering computation and
-forced to float16 directly. Both are consistently extreme outliers across
-every architecture profiled so far, and leaving them in the score array
-drags the median/MAD and compresses the effective score range for every
-other layer — making it harder for k-means to separate the middle layers
-from each other. This is a fixed RULE (always float16 at the edges),
-justified by data observed across models, not a guessed SCORE threshold.
 """
 
 import os
@@ -115,16 +101,6 @@ def _kmeans_1d(values: np.ndarray, k: int, n_iter: int = 200) -> tuple:
     Jenks Natural Breaks (used for choropleth map classification), which is
     exactly this problem: bucket a 1D score column into a small number of
     meaningfully-different groups.
-
-    Two earlier attempts at this file used hand-rolled "gap detection"
-    heuristics (largest gap / first abnormal gap / last abnormal gap on a
-    robust-z'd gap sequence). All three failed in testing against real
-    profiler data — they either starved a tier to a single element when the
-    top layer was extreme, or cascaded and swallowed almost every layer into
-    the top tier once the walk crossed into the flat noise band. K-means
-    doesn't have those failure modes: it directly minimizes within-cluster
-    variance, so it naturally finds where a score column actually clusters,
-    regardless of how skewed the top of the distribution is.
     """
     values = np.asarray(values, dtype=float)
     n = len(values)
@@ -247,22 +223,6 @@ def profile_model(
     all_scores = [r["score"] for r in raw_results]
 
     # ---- Pass 2: adaptive precision assignment ------------------------------
-    # First and last layers are consistently the extreme outliers across
-    # every architecture profiled so far (Mistral: L0 kurtosis 20.5 vs ~4
-    # baseline; L31 11.4 vs ~4 — same bookend pattern seen on other models).
-    # Leaving them IN the clustering computation drags the median/MAD and
-    # compresses the score range for every other layer, making it harder
-    # for k-means to find real structure among the middle layers (on
-    # Mistral this produced 29/32 layers dumped into a single int4 bucket
-    # with almost no separation between them).
-    #
-    # Fix: force the first and last layer to float16 directly — skip them
-    # entirely, they never enter the array k-means clusters on. This is a
-    # fixed RULE (not a fixed threshold): it's justified by data observed
-    # across multiple models, not a guessed cutoff value. k stays at 3 for
-    # the middle layers — more resolution there is strictly better, not
-    # worse, and 3 remains tied to the number of bit-width tiers FlyLLM
-    # offers, not an arbitrary tuning knob.
     n_layers = len(layer_indices)
 
     if n_layers <= 2:
