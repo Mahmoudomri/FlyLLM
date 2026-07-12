@@ -173,7 +173,7 @@ hardware:
 
 | Model | Layers | fp16/int8/int4 | Avg bits | Size reduction | Peak VRAM | Speed |
 |---|---|---|---|---|---|---|
-| Qwen2.5-7B-Instruct | 28 | 4 / 6 / 18 | 6.57 | 58.9% | 57.4% | 2.13 GB | 0.40 tok/S |
+| Qwen2.5-7B-Instruct | 28 | 4 / 6 / 18 | 6.57 |  57.4% | 2.13 GB | 0.40 tok/S |
 | Mistral-7B-Instruct-v0.3 | 32 | 3 / 20 / 9 | 7.62 | 52.3% | 2.21 GB | ~0.45 tok/s |
 | Phi-3-mini-4k-instruct | 32 | 2 / 13 / 17 | 6.38 | 60.2% | 2.36 GB | ~0.80 tok/s |
 
