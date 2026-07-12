@@ -18,8 +18,7 @@ class HFEngine(BaseEngine):
         if self.verbose:
             print(f"  Loading via HuggingFace fallback ({self.cfg.model_type})...")
 
-        # Build the model with EMPTY/meta weights only — no real fp16
-        # storage is allocated for the decoder layers at this point.
+      
         self.model = AutoModelForCausalLM.from_pretrained(
             self.cfg.model_id,
             torch_dtype=DTYPE,
@@ -28,15 +27,9 @@ class HFEngine(BaseEngine):
         )
         self.model.eval()
 
-        # RoPE's inv_freq buffer is computed from config, not loaded
-        # from the checkpoint — but under device_map="meta" it's still
-        # created as a meta tensor with no real data. Fix it now,
-        # before anything tries to use it.
+      
         self._fix_rotary_buffers()
 
-        # Keep compressed layers RAW in RAM — never dequantized here.
-        # This dict is the only place the model's decoder weights live
-        # persistently; it stays populated for the whole session.
         self.cache_layers = {}
         cfg = self.cfg
         for idx in range(cfg.num_hidden_layers):
@@ -50,46 +43,20 @@ class HFEngine(BaseEngine):
         if self.verbose:
             print(f"\n  All {cfg.num_hidden_layers} layers in RAM (compressed).")
 
-        # Static weights (embed/norm/lm_head) need real values loaded
-        # once — they're small relative to the decoder stack. These
-        # also start as meta tensors and need the same _parameters
-        # replacement trick, not a .data assignment.
+  
         self._load_static_weights()
-
-        # Attach hooks: dequant-inject before each layer runs,
-        # free right after it's done.
         self._attach_lazy_hooks()
-
-        # Pipelining state: a second CUDA stream lets us dequant layer
-        # N+1 WHILE the GPU is still busy computing layer N's matmuls,
-        # instead of doing dequant-then-compute strictly back to back.
-        # On CPU-only setups there's no stream concept, so this is a
-        # no-op and behaves like the non-pipelined version.
         self._dequant_stream    = torch.cuda.Stream() if DEVICE == "cuda" else None
         self._prefetch_cache    = {}   # idx -> dequantized weights, ready to use
         self._prefetch_events   = {}   # idx -> cuda.Event signaling "dequant done"
-
-        # torch.cuda.empty_cache() forces a full device sync — calling
-        # it on EVERY layer defeats the pipeline (it blocks until the
-        # background dequant stream is fully caught up, which is
-        # exactly the wait we're trying to hide). Instead, only free
-        # every EMPTY_CACHE_EVERY layers — frequent enough to avoid
-        # fragmentation OOMs on small GPUs, rare enough to preserve
-        # most of the overlap. Set to 1 to restore the old per-layer
-        # behavior if you hit memory issues.
         self.EMPTY_CACHE_EVERY = 8
-
         if self.verbose:
             print(f"  Model ready — layers stay compressed, "
                   f"decompressed on demand per forward call "
                   f"(pipelined prefetch: {'on' if self._dequant_stream else 'off'}).")
 
     def _fix_rotary_buffers(self):
-        """inv_freq is computed from config (not loaded from checkpoint),
-        but under device_map='meta' it's created as a meta tensor too and
-        never gets real values assigned. Recompute it directly from the
-        standard RoPE formula and replace the buffer object (same trick
-        as _set_param, to avoid the meta-tensor copy error)."""
+    
         cfg = self.cfg
         head_dim = getattr(cfg, "head_dim", None) or (
             cfg.hidden_size // cfg.num_attention_heads
@@ -140,21 +107,9 @@ class HFEngine(BaseEngine):
                     print(f"  WARNING: could not set static param {key}")
 
     def _dequant_layer(self, idx):
-        """Dequantize one layer's compressed tensors to fp16, with the
-        actual dequant MATH happening on DEVICE (GPU), not on CPU.
+    
 
-        Old approach: dequant on CPU (slow Python/PyTorch-CPU tensor
-        ops), then transfer the big fp16 result to GPU.
-        New approach: transfer the small COMPRESSED bytes to GPU first
-        (cheap — int4 is ~4x smaller than fp16), then do the unpack +
-        scale multiply on GPU (CUDA tensor ops are much faster than
-        the same ops on CPU). Net effect: less data moved, and the
-        compute itself is faster.
-
-        Reads only from self.cache_layers[idx] (RAM, compressed) —
-        never mutates it, so the same compressed copy is reused
-        every single token.
-        """
+    
         raw = self.cache_layers.get(idx)
         if raw is None:
             return {}
@@ -199,11 +154,7 @@ class HFEngine(BaseEngine):
         return out
 
     def _prefetch_layer(self, idx):
-        """Launch dequant of layer `idx` on the background stream, so
-        it runs concurrently with whatever the main stream is doing
-        (i.e. the current layer's forward matmuls). Result lands in
-        self._prefetch_cache[idx] once done; an Event lets pre_hook
-        wait for exactly that point instead of a full device sync."""
+      
         if idx >= self.cfg.num_hidden_layers or idx in self._prefetch_cache:
             return
         if self._dequant_stream is None:
@@ -217,16 +168,11 @@ class HFEngine(BaseEngine):
             self._prefetch_events[idx] = event
 
     def _get_layer_weights(self, idx):
-        """Fetch layer idx's dequantized weights, waiting only if the
-        background prefetch for it hasn't finished yet. Falls back to
-        an inline (blocking) dequant if it was never prefetched at all
-        — e.g. layer 0 on the very first forward call."""
+    
         if idx not in self._prefetch_cache:
             self._prefetch_layer(idx)
         if self._dequant_stream is not None and idx in self._prefetch_events:
-            # Make the MAIN stream wait for the dequant stream to reach
-            # this point — cheap if it's already done, blocks briefly
-            # if the layer's forward pass was faster than its dequant.
+           
             torch.cuda.current_stream().wait_event(self._prefetch_events.pop(idx))
         return self._prefetch_cache.pop(idx)
 
@@ -236,24 +182,10 @@ class HFEngine(BaseEngine):
             layer = self.model.model.layers[idx]
 
             def pre_hook(module, inputs, idx=idx, layer=layer):
-                # Grab this layer's weights — dequant may already be
-                # done in the background (prefetched during the
-                # PREVIOUS layer's forward pass), or done inline now
-                # if this is the very first layer.
+            
                 weights = self._get_layer_weights(idx)
 
-                # IMPORTANT: these tensors were produced on the
-                # background dequant stream but are about to be read
-                # by the MAIN stream (this layer's forward matmuls).
-                # The cuda.Event wait already guarantees correct
-                # ORDERING of the compute, but PyTorch's caching
-                # allocator can still reuse the underlying memory
-                # blocks for a new allocation on the dequant stream
-                # (e.g. prefetching layer idx+2 later) before the main
-                # stream is done reading — silent corruption (NaNs in
-                # logits) rather than a clean crash. record_stream()
-                # tells the allocator "the current stream still needs
-                # this memory", preventing that premature reuse.
+            
                 if DEVICE == "cuda":
                     current = torch.cuda.current_stream()
                     for t in weights.values():
@@ -270,18 +202,12 @@ class HFEngine(BaseEngine):
                     except AttributeError:
                         pass
 
-                # Kick off dequant of the NEXT layer now, on the
-                # background stream, so it overlaps with THIS layer's
-                # upcoming forward compute instead of waiting for it.
+               
                 self._prefetch_layer(idx + 1)
                 return inputs
 
             def post_hook(module, inputs, output, idx=idx, layer=layer):
-                # Free this layer's fp16 weights right after it's done —
-                # the compressed original in self.cache_layers is untouched.
-                # Replace each real Parameter with a tiny empty one (not
-                # meta — meta tensors can trigger the same set_data
-                # incompatibility on the NEXT pre_hook injection).
+            
                 for sub_module in layer.modules():
                     for pname, p in list(sub_module._parameters.items()):
                         if p is not None and p.numel() > 0:
