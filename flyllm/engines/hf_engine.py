@@ -1,34 +1,6 @@
 """
 FlyLLM - HuggingFace Fallback Engine
 For any model not covered by custom engines (Phi, Qwen2, Falcon, etc.)
-
-Lazy per-layer dequantization: the model stays compressed (int4/int8)
-in RAM at all times. Each decoder layer is dequantized to fp16 only
-during its own forward pass (via a pre-hook), and freed immediately
-after (via a post-hook). At any given moment only ONE layer's worth
-of fp16 weights exists on the GPU/CPU, instead of the whole model.
-
-NOTE: the model is built with device_map="meta", so its parameters
-start as meta tensors (no real storage). Meta tensors are a distinct
-type from real tensors, so PyTorch refuses `param.data = real_tensor`
-(RuntimeError: incompatible tensor type). The fix is to replace the
-Parameter object itself in the module's `_parameters` dict instead of
-mutating `.data` on the existing (meta) Parameter.
-
-Pipelined prefetch: while the GPU is busy running layer N's forward
-matmuls (main CUDA stream), layer N+1's dequant runs concurrently on
-a SEPARATE CUDA stream. By the time layer N finishes, N+1's weights
-are often already sitting in fp16 ready to use — so the dequant cost
-is hidden behind the compute cost instead of adding to it. On CPU-only
-setups there are no streams, so this degrades gracefully to inline
-(non-overlapped) dequant.
-
-Trade-off: every layer is still re-dequantized on every single forward
-call (every token) — that repeated work doesn't go away, and RAM/VRAM
-footprint stays low (at most ~2 layers' worth of fp16 weights exist at
-once: the one currently running + the one being prefetched). What the
-pipeline buys back is wall-clock time, by overlapping dequant with
-compute instead of doing them strictly back to back.
 """
 import os
 import torch
