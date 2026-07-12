@@ -41,14 +41,16 @@ L27  → float16  🔴  extreme outlier layer — always protected
 ```
 
 The first and last layers are **always** float16, and are excluded from
-the k-means computation itself — not just from the final assignment. This
-matters: leaving them in the clustering data drags the median/MAD and
-compresses the effective score range for every other layer, making it
-much harder for k-means to find real structure among the middle layers.
-Excluding them gives materially better resolution — on Mistral-7B this
-took the middle-layer split from 2 int8 / 29 int4 to 20 int8 / 9 int4,
-and fixed a real generation-quality regression (see
-[Why exclude the edges](#why-exclude-the-edges-from-clustering) below).
+the k-means computation itself — not just from the final assignment. 
+This matters: these layers are typically more sensitive because the first
+layer influences how input representations are formed and propagated through
+the network, while the final layer directly affects output token prediction.
+Leaving them in the clustering data introduces these high-sensitivity outliers,
+which drags the median/MAD and compresses the effective score range for every 
+other layer, making it much harder for k-means to find real structure among the middle layers.
+Excluding them gives materially better resolution — allowing the adaptive algorithm to allocate 
+precision more accurately where it is needed.
+
 
 ---
 
