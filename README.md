@@ -168,9 +168,7 @@ memory — never the whole model.
 
 ## How it performs
 
-Real numbers, FlyLLM vs. unquantized fp16 on identical prompts, same
-hardware:
-
+Real numbers :FlyLLM Results
 | Model | Layers | fp16/int8/int4 | Avg bits | Size reduction | Peak VRAM | Speed |
 |---|---|---|---|---|---|---|
 | Qwen2.5-7B-Instruct | 28 | 4 / 6 / 18 | 6.57 |  57.4% | 2.13 GB | 0.40 tok/s |
